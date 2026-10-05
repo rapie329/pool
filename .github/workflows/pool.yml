@@ -1,0 +1,181 @@
+name: pool
+
+# ============================================================
+# pool.yml — turns a GitHub Actions runner into a scratch box
+#   dispatch it, it boots a container, installs a tool profile,
+#   runs your task, and tears down.
+#
+#   free plan: minutes only count on PUBLIC repos, 6h/job max.
+#   total: 2000 min/mo.
+# ============================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'tool profile: base|net|rev|web|build|android|forensic|all'
+        required: true
+        default: base
+      task:
+        description: 'shell command to run (leave empty for idle keep-alive)'
+        required: false
+        default: ''
+      minutes:
+        description: 'keep-alive minutes after task finishes (max 350)'
+        required: false
+        default: '0'
+      push_work:
+        description: 'push /opt/work + ~/.state back to the repo when done'
+        type: boolean
+        default: false
+  schedule:
+    # warm standby every 5h, keeps caches fresh under the 7d eviction
+    - cron: '17 */5 * * *'
+
+permissions:
+  contents: write   # for optional push_work
+
+concurrency:
+  group: pool-${{ github.repository }}
+  cancel-in-progress: false   # never kill a running task
+
+env:
+  STATE_DIR: /opt/work
+  CACHE_KEY: pool-ubuntu-v3
+
+jobs:
+  box:
+    # max runtime guard — free tier kills at 6h anyway, fail loud at 5h50
+    timeout-minutes: 350
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [x64]
+
+    steps:
+      - name: init state
+        run: |
+          sudo mkdir -p "$STATE_DIR" ~/.state ~/tools
+          sudo chown -R "$(id -u):$(id -g)" "$STATE_DIR" ~/.state ~/tools
+          echo "uname: $(uname -a)" | tee ~/.state/fingerprint.txt
+          echo "date:  $(date -u)"   | tee -a ~/.state/fingerprint.txt
+          free -h | tee -a ~/.state/fingerprint.txt
+          nproc | sed 's/^/cores: /' | tee -a ~/.state/fingerprint.txt
+          df -h / | tail -1 | tee -a ~/.state/fingerprint.txt
+
+      - name: restore cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ env.STATE_DIR }}
+            ~/.state
+            ~/tools
+          key: ${{ env.CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ env.CACHE_KEY }}-
+
+      - name: banner
+        run: |
+          cat <<'B'
+          ╔══════════════════════════════════════════════════╗
+          ║  pool runner up                                   ║
+          ║  host   : $HOSTNAME
+          ║  state  : $STATE_DIR  (cache: ${{ steps.cache.outputs.cache-hit }})
+          ║  quota  : free tier = 2000 min/mo, 6h/job hard cap
+          ╚══════════════════════════════════════════════════╝
+          B
+
+      - name: checkout (shallow)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          continue-on-error: true
+
+      - name: install tool profile
+        id: prof
+        run: |
+          # dispatch input wins; scheduled runs just re-warm caches
+          PROF="${{ inputs.profile }}"
+          [ -n "$PROF" ] || PROF=base
+          echo "profile=$PROF" >> "$GITHUB_OUTPUT"
+          if [ -f ops/setup.sh ]; then
+            bash ops/setup.sh "$PROF" 2>&1 | tee /tmp/setup.log
+          else
+            echo "!! ops/setup.sh not in repo — bare container"
+          fi
+
+      - name: manifest
+        if: always()
+        run: |
+          {
+            echo "# pool manifest $(date -u +%FT%TZ) profile=${{ steps.prof.outputs.profile }}"
+            for b in bash git curl python3 node go gcc java docker nmap r2 jadx tmux; do
+              printf '%-10s %s\n' "$b" "$(command -v $b || echo -)"
+            done
+          } | tee ~/.state/manifest.txt
+
+      - name: run task
+        if: ${{ inputs.task != '' }}
+        run: |
+          set -o pipefail
+          echo '```'
+          echo "▶ task: ${{ inputs.task }}"
+          echo '```'
+          eval "${{ inputs.task }}" 2>&1 | tee -a /tmp/task.log
+          ec=${PIPESTATUS[0]}
+          echo "exit=$ec" | tee -a /tmp/task.log
+          # don't fail the job on task error — logs matter more than status
+          exit 0
+
+      - name: keep-alive
+        if: ${{ always() && inputs.minutes != '' && inputs.minutes != '0' }}
+        run: |
+          M=${{ inputs.minutes }}
+          LOG="keep-alive: holding box $M min"
+          sed -i "s/\r$//" "$LOG"
+          echo "$LOG"
+          echo "you are on a live ubuntu box. type 'exit' to end."
+          # interactive-ish hold; survives nohup-less pipes
+          end=$(( $(date +%s) + M*60 ))
+          while [ "$(date +%s)" -lt "$end" ]; do
+            if [ -f /tmp/stop ]; then echo "stop requested"; break; fi
+            printf '\r  [%s] %s min left   ' "$(date -u +%H:%M:%S)" "$(( (end-$(date +%s))/60 ))"
+            sleep 60
+          done
+          echo
+
+      - name: save cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ env.STATE_DIR }}
+            ~/.state
+          key: ${{ env.CACHE_KEY }}-${{ github.run_id }}
+
+      - name: push work back
+        if: ${{ always() && inputs.push_work }}
+        run: |
+          git config user.name  'pool-bot'
+          git config user.email 'pool@users.noreply.github.com'
+          git checkout -B pool-output || true
+          mkdir -p out && cp -r "$STATE_DIR"/. out/ 2>/dev/null || true
+          cp /tmp/task.log out/ 2>/dev/null || true
+          git add -A out
+          git diff --staged --quiet || git commit -m "pool: $(date -u +%FT%TZ) task output"
+          git push -f origin pool-output || echo "push failed (branch protection?)"
+
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo "## pool report"
+            echo "- run: \`${{ github.run_id }}\`"
+            echo "- profile: \`${{ steps.prof.outputs.profile }}\`"
+            echo "- cache-hit: \`${{ steps.cache.outputs.cache-hit || 'miss' }}\`"
+            echo ""
+            echo '```'
+            tail -40 /tmp/task.log 2>/dev/null || echo '(no task output)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
