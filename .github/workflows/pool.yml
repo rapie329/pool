@@ -78,12 +78,14 @@ jobs:
 
       - name: banner
         run: |
-          cat <<'B'
+          cat <<B
           ╔══════════════════════════════════════════════════╗
           ║  pool runner up                                   ║
-          ║  host   : $HOSTNAME
-          ║  state  : $STATE_DIR  (cache: ${{ steps.cache.outputs.cache-hit }})
-          ║  quota  : free tier = 2000 min/mo, 6h/job hard cap
+          ║  host    : \$(hostname)
+          ║  state   : ${STATE_DIR}
+          ║  cache   : ${{ steps.cache.outputs.cache-hit || 'miss' }}
+          ║  cores   : \$(nproc)   mem: \$(free -h | awk '/Mem:/{print \$2}')
+          ║  quota   : free tier 2000 min/mo — public repos only
           ╚══════════════════════════════════════════════════╝
           B
 
@@ -95,10 +97,11 @@ jobs:
 
       - name: install tool profile
         id: prof
+        env:
+          PROF_IN: ${{ inputs.profile }}
         run: |
           # dispatch input wins; scheduled runs just re-warm caches
-          PROF="${{ inputs.profile }}"
-          [ -n "$PROF" ] || PROF=base
+          PROF="${PROF_IN:-base}"
           echo "profile=$PROF" >> "$GITHUB_OUTPUT"
           if [ -f ops/setup.sh ]; then
             bash ops/setup.sh "$PROF" 2>&1 | tee /tmp/setup.log
@@ -118,12 +121,18 @@ jobs:
 
       - name: run task
         if: ${{ inputs.task != '' }}
+        env:
+          # pass the task as an env var, never as interpolated source —
+          # ${{ }} inside double quotes lets bash re-parse quotes/$(...)/parens
+          TASK: ${{ inputs.task }}
         run: |
           set -o pipefail
-          echo '```'
-          echo "▶ task: ${{ inputs.task }}"
-          echo '```'
-          eval "${{ inputs.task }}" 2>&1 | tee -a /tmp/task.log
+          {
+            echo '```'
+            echo "task: $TASK"
+            echo '```'
+          }
+          eval "$TASK" 2>&1 | tee -a /tmp/task.log
           ec=${PIPESTATUS[0]}
           echo "exit=$ec" | tee -a /tmp/task.log
           # don't fail the job on task error — logs matter more than status
